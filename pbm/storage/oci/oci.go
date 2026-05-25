@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/oracle/oci-go-sdk/v65/common"
@@ -217,7 +218,9 @@ func (o *OCI) Save(name string, data io.Reader, options ...storage.Option) error
 			storage.PrettySize(partSize))
 	}
 
-	_, err := transfer.NewUploadManager().UploadStream(context.Background(), transfer.UploadStreamRequest{
+	var uploadedParts atomic.Int64
+	ctx := context.Background()
+	_, err := transfer.NewUploadManager().UploadStream(ctx, transfer.UploadStreamRequest{
 		UploadRequest: transfer.UploadRequest{
 			NamespaceName:         common.String(o.cfg.Namespace),
 			BucketName:            common.String(o.cfg.Bucket),
@@ -227,13 +230,33 @@ func (o *OCI) Save(name string, data io.Reader, options ...storage.Option) error
 			AllowParrallelUploads: common.Bool(true),
 			NumberOfGoroutines:    common.Int(o.cfg.UploadConcurrency),
 			ObjectStorageClient:   o.client,
+			CallBack: func(part transfer.MultiPartUploadPart) {
+				if part.Err == nil && part.Etag != nil {
+					uploadedParts.Add(1)
+				}
+			},
 			// Override transfer manager's default, which retries any non-2xx response.
 			RequestMetadata: common.RequestMetadata{RetryPolicy: o.client.RetryPolicy()},
 		},
 		StreamReader: data,
 	})
+	if isNoPartsCommitError(err) && uploadedParts.Load() == 0 {
+		err = o.putEmptyObject(ctx, name)
+	}
 
 	return errors.Wrap(err, "upload stream")
+}
+
+func (o *OCI) putEmptyObject(ctx context.Context, name string) error {
+	_, err := o.client.PutObject(ctx, objectstorage.PutObjectRequest{
+		NamespaceName:   common.String(o.cfg.Namespace),
+		BucketName:      common.String(o.cfg.Bucket),
+		ObjectName:      common.String(o.key(name)),
+		ContentLength:   common.Int64(0),
+		PutObjectBody:   http.NoBody,
+		RequestMetadata: common.RequestMetadata{RetryPolicy: o.client.RetryPolicy()},
+	})
+	return err
 }
 
 func (o *OCI) FileStat(name string) (storage.FileInfo, error) {
@@ -434,6 +457,20 @@ func (o *OCI) key(name string) string {
 func isNotFound(err error) bool {
 	if se, ok := common.IsServiceError(err); ok {
 		return se.GetHTTPStatusCode() == http.StatusNotFound
+	}
+	return false
+}
+
+func isNoPartsCommitError(err error) bool {
+	if se, ok := common.IsServiceError(err); ok {
+		if se.GetCode() != "InvalidUploadPart" {
+			return false
+		}
+		if rich, ok := se.(common.ServiceErrorRichInfo); ok && rich.GetOperationName() != "CommitMultipartUpload" {
+			return false
+		}
+
+		return strings.Contains(se.GetMessage(), "There are no parts to commit")
 	}
 	return false
 }
